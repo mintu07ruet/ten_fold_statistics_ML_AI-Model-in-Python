@@ -1,0 +1,250 @@
+---
+title: "NB_model_Aug21"
+author: "Md Mintu Miah, Ph.D."
+date: "2023-08-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# read necessary library
+rm(list = ls())
+
+if (!require("pacman")) install.packages("pacman")
+p_load(dplyr)
+#p_load(MASS)
+p_load(sandwich)
+#library(mgcv)
+p_load(lmtest)
+p_load(caret)
+p_load(AER)
+p_load(cvTools)
+p_load(ggplot2)
+p_load(readr)
+if(!require("glmnet")) install.packages("glmnet")
+#library(plyr)
+#library(glmmTMB)
+```
+
+
+
+
+```{r}
+##### FUNCTION DEFINITIONS #####
+cvstats <- function (p, k, r=1) {
+  n = k * r
+  stats <- p %>%
+    group_by(Resample) %>%
+    summarize(rmse=sqrt(mean((pred - obs) ^ 2)),
+              mae=mean(abs(pred - obs)),
+              mape=mean(abs((pred - obs) / obs * 100)),
+              r2=cor(pred, obs,use="complete.obs")^2,
+              mfr2=((sum()))) %>%
+    summarize(mean(rmse), se_rmse=sd(rmse)/sqrt(n), mean(mae), 
+              se_mae=sd(mae)/sqrt(n), mean(mape), se_mape=sd(mape)/sqrt(n),
+              mean(r2), se_r2=sd(r2)/sqrt(n))
+  stats
+}
+
+cvstats.tertile <- function(p, k, r=1) {
+  # Note: assignment is stochastic at boundaries, thus the fractional n's
+  n_cv = k * r  # total out of sample predictions
+  
+  stats <- p %>% 
+    mutate(tertile = ntile(obs, 3)) %>%
+    group_by(Resample, tertile) %>%
+    summarize(rmse=sqrt(mean((pred - obs) ^ 2)),
+              mae=mean(abs(pred - obs)),
+              mape=mean(abs((pred - obs) / obs * 100)),
+              r2=cor(pred, obs, use="complete.obs")^2, n=n()) %>%
+    group_by(tertile) %>%
+    summarize(mean(rmse), se_rmse=sd(rmse)/sqrt(n_cv), mean(mae), 
+              se_mae=sd(mae)/sqrt(n_cv), mean(mape), se_mape=sd(mape)/sqrt(n_cv),
+              mean(r2), se_r2=sd(r2)/sqrt(n_cv), n=sum(n)/r)
+  
+  stats
+}
+
+cvstats.county <- function(m, d, k, r) {
+  # for now group must be in select var list
+  #n_cv = k * r
+  
+  p2 <- d %>% select(rowIndex, tdg_id, county, AADB) %>%
+    inner_join(m$pred, by="rowIndex") 
+  
+  n_reg <- p2 %>%
+    distinct(rowIndex, county) %>%
+    group_by(county) %>%
+    summarize(n=n())
+  
+  stats <- p2 %>% 
+    group_by(Resample, county) %>%
+    summarize(rmse=sqrt(mean((pred - obs) ^ 2)),
+              mae=mean(abs(pred - obs)),
+              mape=mean(abs((pred - obs) / obs * 100)),
+              ae=mean(pred-obs),
+              ape=mean((pred - obs) / obs * 100),
+              r2=cor(pred, obs, use="complete.obs")^2,
+              n=n()) %>%
+    group_by(county) %>%
+    summarize(mean(rmse), mean(mae), 
+              mean(mape), mean(r2, na.rm=F)) %>%
+    left_join(n_reg, by="county")
+  
+  stats
+}
+
+cvstats.pattern <- function(m, d, k, r) {
+  # for now group must be in select var list
+  p2 <- d %>% select(rowIndex, tdg_id, county, AADB, Leg) %>%
+    inner_join(m$pred, by="rowIndex")
+  
+  stats <- p2 %>% 
+    group_by(Leg) %>%
+    summarize(rmse=sqrt(mean((pred - obs) ^ 2)),
+              mae=mean(abs(pred - obs)),
+              mape=mean(abs((pred - obs) / obs * 100)),
+              avgpe=mean((pred - obs) / obs * 100),
+              avgerr=mean(pred-obs))
+  print(stats)
+}
+
+mf_r2 <- function(m) {
+  # McFadden's pseudo-R2
+  r2 <- 1 - (m$deviance / m$null.deviance)
+  r2
+}
+
+summarize_model <- function(m, d, k, r, robust_se="HC3") {
+  # m - model train/test results from caret package
+  # k - number of Cv folds
+  # r - number of fold repeats
+  p <- m$pred
+  print(cvstats(p, k, r))
+  print(cvstats.tertile(p, k, r))
+  print(cvstats.county(m, d, k, r))
+  print(summary(m))
+  print("")
+  print(paste("McFadden's pseudo-R2 =", mf_r2(m$finalModel)))
+  print("")
+  print(coeftest(m$finalModel, 
+                 vcov = vcovHC(m$finalModel, type=robust_se)))  # robust SEs 
+}
+
+plot_regions <- function(m, d, title="", scales="fixed") {
+  p2 <- d %>% select(rowIndex, tdg_id, county, AADB, Leg) %>%
+    inner_join(m$pred, by="rowIndex") %>%
+    group_by(tdg_id, county, Leg) %>%
+    summarize(avg_obs=mean(obs), avg_pred=mean(pred))
+  
+  p2 %>% ggplot(aes(x=avg_pred, y=avg_obs)) +
+    geom_point(col="blue") +coord_flip(ylim = c(0,3300), xlim = c(0,3300))+
+    geom_abline(intercept=0, slope=1, lty=2) +
+    facet_wrap(~ county, scales=scales) +
+    labs(x="mean predicted AADBT", y="observed AADBT") +
+    ggtitle(title)
+}
+
+
+plot_all <- function(m, d, title="", label_outliers=0) {
+  # label_outliers - label if avg err falls in top X pct of cases
+  p2 <- d %>% select(rowIndex, tdg_id, county, AADB, Leg,year) %>%
+    inner_join(m$pred, by="rowIndex") %>%
+    group_by(tdg_id,county, Leg, year) %>%
+    summarize(avg_obs=mean(obs), avg_pred=mean(pred)) %>%
+    mutate(avg_err=mean(avg_pred - avg_obs)) 
+    label_min <- quantile(abs(p2$avg_err), p=((100 - label_outliers) / 100))
+  
+  p2 %>% ggplot(aes(x=avg_pred, y=avg_obs, col=as.factor(county),
+                    shape=as.factor(county))) +
+    geom_abline(intercept=0, slope=1, lty=2) +
+    geom_point(size=2.0, fill=NA) +coord_flip(ylim = c(0,3300), xlim = c(0, 3300))+
+    labs(x="Mean predicted AADBT", y="Observed AADBT") + 
+    geom_text(data=subset(p2, avg_err >= 0 & abs(avg_err) >= label_min),
+              aes(avg_pred, avg_obs, label=substr(county, 1, 27)),
+              nudge_y=30, size=3) +
+    geom_text(data=subset(p2, avg_err < 0 & abs(avg_err) >= label_min),
+              aes(avg_pred, avg_obs, label=substr(county, 1, 27)),
+              nudge_y=-30, size=3) +
+    ggtitle(title)
+}
+
+```
+
+# read the data
+```{r}
+data3=read.csv('D:/Bike Exposure/Modeling/Model_clean_data_july23_AADBT.csv')
+head(data3)
+```
+
+# Import necessary library
+```{r}
+require(foreign)
+require(ggplot2)
+require(MASS)
+require(boot)
+```
+```{r}
+nrow(data3)
+```
+```{r}
+nb_data=subset(data3, select =c(AADB,Stv_commute_adb,Stv_leisure_adb,pctbiketowork_q,pctnoveh_h,popdensitysqmi_h,slope,totatleastbachelorspersqmi_h,near_univ_miles,exist_bike_parking_q,pct_low_wage,Network_density3,Intersection_density5,pctlowintensity_h,pcthighintensity_h,Speed_25_or_Above,empnum_density_q,pctwhite_q,medhhincome_q))
+nb_data[is.na(nb_data)] <- 0
+```
+
+```{r}
+# Set up train/test controller 
+seed = 94704 
+k = 10  # folds
+r = 10  # repeats
+set.seed(seed)  # note checked fairly stable w/ seed changes
+
+# Note: eventually went back to caret w/ stratified folds 
+train_control5 <- trainControl(method="repeatedcv", number=k, repeats=r,
+                               savePredictions = TRUE)
+```
+
+
+
+```{r}
+set.seed(94704)
+nb<- glm.nb(AADB ~log(Stv_commute_adb+0.01)+log(Stv_leisure_adb+0.01)+pctbiketowork_q+pctnoveh_h+log(slope+0.01)+totatleastbachelorspersqmi_h+near_univ_miles+exist_bike_parking_q+pct_low_wage+Network_density3+Intersection_density5+pctlowintensity_h+pcthighintensity_h+Speed_25_or_Above+empnum_density_q+pctwhite_q, data = nb_data)
+#summarize_model(nb, data3, k, r)
+#This code will run for negative binomial GLM models.
+nb1=cv.glm(data=nb_data,nb,K=10)
+nb1$delta
+```
+```{r}
+sqrt(nb1$delta)
+```
+
+
+```{r}
+options(scipen=999)
+summary(nb)
+```
+
+
+
+# run the negative binomial regression
+```{r}
+set.seed(seed)
+nmc <- train(AADB ~log(Stv_commute_adb+0.01)+log(Stv_leisure_adb+0.01)+pctbiketowork_q
++pctnoveh_h+popdensitysqmi_h
++log(slope+0.01)+totatleastbachelorspersqmi_h
++near_univ_miles+exist_bike_parking_q+pct_low_wage+Network_density3+Intersection_density5+pctlowintensity_h+pcthighintensity_h+Speed_25_or_Above+empnum_density_q+pctwhite_q+medhhincome_q
+,
+            
+    #Stv_commute+Stv_leisure+pctbiketowork_q+totatleastbachelorspersqmi_h+log(totnovehpersqmi_h+0.01)+sqrt(hshldden#sitysqmi_t)+tertiary+speed_0_25
+                data =data3, method = "glm",family="nbinom2",
+                trControl = train_control5, na.action=na.exclude)
+#family=sm.families.NegativeBinomial(link=sm.families.links.identity)
+#family='poisson
+# for nargative Binomial: family="nbinom2"
+summarize_model(nmc, data3, k, r)
+plot_regions(nmc, data3, title="CA Bicycle Exposure Static+Emerging Model", scales="fixed")  # scales="free" or 'fixed' is an option
+plot_all(nmc, data3, title="CA Bicycle Exposure Static+Emerging Model", label_outliers=NA)  # label outliers in top X%, NA turns off labeling
+```
